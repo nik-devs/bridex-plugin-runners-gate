@@ -263,6 +263,41 @@ export default async function activate(ctx) {
   timer.unref?.();
   ctx.onShutdown(() => clearInterval(timer));
 
+  // -- dashboard stat tile: running workers + bucket usage ------------------
+  // (guarded: older hosts don't have registerStat yet)
+
+  if (typeof ctx.registerStat === "function" && defaultBucket) {
+    let bucketCache = { at: 0, gb: null };
+    const bucketUsedGb = async () => {
+      if (Date.now() - bucketCache.at < 300_000) return bucketCache.gb;
+      const token = await gcpToken();
+      let bytes = 0;
+      let pageToken = "";
+      // cap the walk: a bucket with >50k objects reports a lower bound
+      for (let page = 0; page < 50; page++) {
+        const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(defaultBucket)}/o?fields=items(size),nextPageToken&maxResults=1000${pageToken ? `&pageToken=${pageToken}` : ""}`;
+        const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        if (!res.ok) throw new Error(`GCS list HTTP ${res.status}`);
+        const data = await res.json();
+        for (const o of data.items ?? []) bytes += Number(o.size ?? 0);
+        pageToken = data.nextPageToken ?? "";
+        if (!pageToken) break;
+      }
+      bucketCache = { at: Date.now(), gb: Math.round((bytes / 1e9) * 10) / 10 };
+      return bucketCache.gb;
+    };
+    ctx.registerStat(async () => {
+      const running = Object.values(jobs).filter((j) => j.status === "pending").length;
+      let sub;
+      try {
+        sub = `bucket ${await bucketUsedGb()} GB used`;
+      } catch {
+        sub = `bucket ${defaultBucket}`;
+      }
+      return [{ label: "Runners", value: running, sub }];
+    });
+  }
+
   const pending = Object.values(jobs).filter((j) => j.status === "pending").length;
   log.info(
     `runners-gate active: ${Object.keys(runners).length} runner(s), ${allOps.length} op(s)${pending ? `, ${pending} pending job(s) resumed` : ""}`,

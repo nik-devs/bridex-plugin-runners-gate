@@ -45,6 +45,13 @@ Op names must be unique across runners — submissions route by op, agents
 never need to know runners exist. `probe` (every worker's built-in
 self-test) is the one op that takes an explicit `runner` argument.
 
+## Dashboard tile
+
+On hosts that support `ctx.registerStat` (bridex ≥ the 2026-09 image) the gate
+contributes a "Runners" tile to the dashboard home: currently running jobs
+and the shared bucket's used space (GCS listing, cached 5 min; buckets over
+50k objects report a lower bound).
+
 ## Worker contract
 
 Per execution the job receives env `RUNNER_JOB_SPEC` (JSON):
