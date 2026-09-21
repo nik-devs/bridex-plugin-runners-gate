@@ -52,6 +52,15 @@ contributes a "Runners" tile to the dashboard home: currently running jobs
 and the shared bucket's used space (GCS listing, cached 5 min; buckets over
 50k objects report a lower bound).
 
+## The last mile (both directions)
+
+The instance does NOT mount the bucket — the gate walks the last mile itself:
+inputs listed as `artifacts/...` are uploaded to `inbox/<job>/` before launch
+(args referencing the same paths are rewritten in lockstep), and finished
+outputs are downloaded into the workspace at `artifacts/renders/<job>/` before
+the agent wakes — the wakeup lists paths the agent can actually touch. If a
+download fails, the wakeup falls back to bucket-relative paths with the error.
+
 ## Worker contract
 
 Per execution the job receives env `RUNNER_JOB_SPEC` (JSON):

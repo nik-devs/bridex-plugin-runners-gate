@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 
 /**
@@ -121,16 +123,75 @@ export default async function activate(ctx) {
 
   // -- waking the requester -------------------------------------------------
 
-  function finish(jobId, ok, detail) {
+  /**
+   * Last mile: the INSTANCE does not mount the bucket, so the gate pulls the
+   * finished files into workspace artifacts itself — agents get paths they
+   * can actually touch (and deliver with `message` media directly).
+   */
+  async function fetchOutputs(job, jobId) {
+    const saved = [];
+    const bucket = job.bucket || defaultBucket;
+    for (const rel of job.outputs ?? []) {
+      const dest = path.join(ctx.paths.workspaceArtifacts(job.workspace), "renders", jobId, path.basename(rel));
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      const token = await gcpToken();
+      const res = await fetch(
+        `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o/${encodeURIComponent(rel)}?alt=media`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!res.ok) throw new Error(`GCS fetch ${rel}: HTTP ${res.status}`);
+      await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(dest));
+      saved.push(`artifacts/renders/${jobId}/${path.basename(rel)}`);
+    }
+    return saved;
+  }
+
+  /**
+   * Way in, same last mile: inputs named `artifacts/...` are files in the
+   * agent's workspace — the instance does not mount the bucket, so the gate
+   * uploads them to `inbox/<jobId>/` and rewrites the spec to bucket paths.
+   * Anything else passes through as an already-bucket-relative path.
+   */
+  async function stageInputs(workspace, jobId, bucket, inputs) {
+    const staged = [];
+    for (const item of inputs) {
+      const rel = String(item);
+      if (!rel.startsWith("artifacts/")) {
+        staged.push(rel);
+        continue;
+      }
+      const abs = path.join(ctx.paths.workspaceArtifacts(workspace), rel.slice("artifacts/".length));
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile())
+        throw new Error(`input not found in workspace artifacts: ${rel}`);
+      const dest = `inbox/${jobId}/${path.basename(abs)}`;
+      const token = await gcpToken();
+      const res = await fetch(
+        `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(bucket)}/o?uploadType=media&name=${encodeURIComponent(dest)}`,
+        { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fs.createReadStream(abs), duplex: "half" },
+      );
+      if (!res.ok) throw new Error(`GCS upload ${rel}: HTTP ${res.status}`);
+      staged.push(dest);
+    }
+    return staged;
+  }
+
+  async function finish(jobId, ok, detail) {
     const job = jobs[jobId];
     if (!job || job.status !== "pending") return; // callback and watchdog may race; first wins
     job.status = ok ? "done" : "failed";
     if (ok) job.outputs = detail.outputs ?? [];
     else job.error = detail.error ?? "unknown";
     persist();
-    const where = job.outputs?.length
-      ? `\nOutputs (bucket-relative):\n${job.outputs.map((o) => `- ${o}`).join("\n")}`
-      : "";
+    let where = "";
+    if (job.outputs?.length) {
+      try {
+        const saved = await fetchOutputs(job, jobId);
+        where = `\nOutputs (already in your workspace artifacts):\n${saved.map((o) => `- ${o}`).join("\n")}`;
+      } catch (e) {
+        log.warn(`job ${jobId}: output download failed: ${e.message}`);
+        where = `\nOutputs are in the shared bucket (download to artifacts FAILED: ${e.message}):\n${job.outputs.map((o) => `- ${o}`).join("\n")}`;
+      }
+    }
     ctx.wakeAgent({
       workspace: job.workspace,
       agent: job.agent,
@@ -147,11 +208,11 @@ export default async function activate(ctx) {
   ctx.registerTool({
     name: "runner_submit",
     description:
-      `Submit ONE heavy operation to a Cloud Run worker and END your run — you will be woken with the result (never poll, never wait in-run). Available ops: ${allOps.join(", ")}. Inputs and outputs live in the shared bucket. Light work stays in your own shell.`,
+      `Submit ONE heavy operation to a Cloud Run worker and END your run — you will be woken with the result (never poll, never wait in-run). Available ops: ${allOps.join(", ")}. Pass your source files as artifacts/... paths — the gate uploads them to the worker and downloads finished outputs back into artifacts/renders/<job>/ for you. Light work stays in your own shell.`,
     schema: {
       op: z.string().describe(`operation name; one of: ${allOps.join(", ")} (or "probe" with an explicit runner)`),
-      args: z.string().describe("JSON object of op arguments (paths bucket-relative)"),
-      inputs: z.string().optional().describe("JSON array of bucket-relative input paths (worker verifies existence before working)"),
+      args: z.string().describe("JSON object of op arguments; reference source files by the SAME paths you list in inputs"),
+      inputs: z.string().optional().describe("JSON array of input paths: artifacts/... (your workspace files — auto-uploaded) or bucket-relative paths from an earlier job"),
       runner: z.string().optional().describe(`explicit runner (${Object.keys(runners).join(", ")}) — only needed for "probe"`),
       deadline_min: z.number().optional().describe(`minutes before the watchdog declares the job dead (default ${DEFAULT_DEADLINE_MIN})`),
     },
@@ -173,10 +234,19 @@ export default async function activate(ctx) {
       const deadlineMin = Number(args.deadline_min) > 0 ? Number(args.deadline_min) : DEFAULT_DEADLINE_MIN;
       const jobId = `rj-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
       try {
-        const execution = await launchExecution(runnerName, jobId, op, parsedArgs, parsedInputs, deadlineMin);
+        const jobBucket = runners[runnerName].bucket || defaultBucket;
+        const stagedInputs = await stageInputs(call.workspace, jobId, jobBucket, parsedInputs);
+        // args may reference the same artifacts/ paths — rewrite them in lockstep
+        let argsJson = JSON.stringify(parsedArgs);
+        parsedInputs.forEach((orig, i) => {
+          if (String(orig).startsWith("artifacts/")) argsJson = argsJson.split(String(orig)).join(stagedInputs[i]);
+        });
+        parsedArgs = JSON.parse(argsJson);
+        const execution = await launchExecution(runnerName, jobId, op, parsedArgs, stagedInputs, deadlineMin);
         jobs[jobId] = {
           op,
           runner: runnerName,
+          bucket: runners[runnerName].bucket || defaultBucket,
           workspace: call.workspace,
           agent: call.agent,
           sessionKey: call.sessionKey,
@@ -229,7 +299,7 @@ export default async function activate(ctx) {
       return c.json({ error: "bad json" }, 400);
     }
     if (!body.job_id || !jobs[body.job_id]) return c.json({ error: "unknown job" }, 404);
-    finish(String(body.job_id), body.ok === true, { outputs: body.outputs, error: body.error });
+    await finish(String(body.job_id), body.ok === true, { outputs: body.outputs, error: body.error });
     return c.json({ ok: true });
   });
   ctx.registerRoute(app);
@@ -242,13 +312,13 @@ export default async function activate(ctx) {
         if (job.status !== "pending") continue;
         try {
           const state = job.execution ? await executionState(job.execution) : null;
-          if (state === "failed") return finish(id, false, { error: "Cloud Run execution failed (no callback received)" });
+          if (state === "failed") return void finish(id, false, { error: "Cloud Run execution failed (no callback received)" });
           if (state === "succeeded") continue; // give the callback a beat; the deadline still backstops
         } catch (err) {
           log.warn(`watchdog poll failed for ${id}: ${err.message}`);
         }
         if (Date.now() > job.deadlineAt)
-          finish(id, false, { error: `deadline exceeded (${Math.round((job.deadlineAt - job.createdAt) / 60000)} min) — treat as hung` });
+          void finish(id, false, { error: `deadline exceeded (${Math.round((job.deadlineAt - job.createdAt) / 60000)} min) — treat as hung` });
       }
       const cutoff = Date.now() - LEDGER_TTL_DAYS * 86_400_000;
       let dirty = false;
