@@ -3,9 +3,25 @@
 # callback) and agent wakeups, which only in-process plugins have — a catalog
 # install of kind "tool" would run out-of-process and silently lose both.
 name: runners-gate
-version: 0.1.0
+version: 0.3.1
 kind: integration
 description: Submit heavy operations to Cloud Run Jobs workers and wake the requesting agent on completion — HMAC callback for speed, execution polling for truth. Multiple runners route by operation name.
 entry: index.mjs
 requires_env:
   - RUNNERS_GATE_CALLBACK_SECRET   # shared HMAC secret with the worker images
+config_schema:
+  type: object
+  properties:
+    callback_base:
+      type: string
+      title: Callback base URL
+      placeholder: https://team.bridex.app
+      description: Public origin of this instance — the worker calls back here
+    bucket:
+      type: string
+      title: Bucket
+      description: GCS bucket shared with the workers
+    price_per_min_usd:
+      type: number
+      title: Price per runner minute, USD
+      description: Optional — turns runner seconds into dollars on task pages and spend tables

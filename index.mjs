@@ -182,6 +182,24 @@ export default async function activate(ctx) {
     if (ok) job.outputs = detail.outputs ?? [];
     else job.error = detail.error ?? "unknown";
     persist();
+    // the render's minutes belong to the task like any other paid tool — the
+    // task page and the spend tables read them (price per minute is optional)
+    try {
+      const seconds = Math.max(1, Math.round((Date.now() - (job.createdAt ?? Date.now())) / 1000));
+      const perMin = Number(cfg.price_per_min_usd ?? 0) || 0;
+      ctx.usage?.record?.({
+        workspace: job.workspace,
+        agent: job.agent,
+        kind: `runner:${job.runner}`,
+        model: job.op,
+        costUsd: (seconds / 60) * perMin,
+        units: seconds,
+        unit: "s",
+        taskId: job.taskId ?? null,
+      });
+    } catch (e) {
+      log.warn(`job ${jobId}: usage record failed: ${e.message}`);
+    }
     let where = "";
     if (job.outputs?.length) {
       try {
