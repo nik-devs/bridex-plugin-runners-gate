@@ -87,3 +87,24 @@ contract.
 Auth to Cloud Run rides the instance VM's metadata server — instance and
 jobs live in one GCP project, no key files anywhere. The instance VM's
 service account needs `run.jobs.run` + `run.executions.get` on the jobs.
+
+## skill_script (0.4.0)
+
+`op: "skill_script"` runs a skill's own builder script on the worker instead of
+the instance — assemblers and caption burners keep their recipes and gates,
+only the place they run moves. Args:
+
+```json
+{"script": "creative-projects/scripts/cartoon_assemble.py",
+ "argv": ["artifacts/t-123/_work/scene_manifest.json"],
+ "cwd": "artifacts/t-123/_work",
+ "outputs": ["final.mp4"],
+ "timeout_min": 25}
+```
+
+The gate bundles the script's skill folder, the work folder and every
+`/data/...` file or folder named in argv or in the text files there (two
+passes), uploads one `bundle.tgz`, and when the job lands puts each output back
+at its original path and hands the agent the full `run.log`. Requires the
+instance home at `/data`; the worker image must serve `skill_script`
+(bridex-runner-montage ≥ 0.5).

@@ -3,6 +3,11 @@ import fs from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
+import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
 
 /**
  * runners-gate: agents submit heavy operations; Cloud Run Jobs execute them
@@ -175,6 +180,107 @@ export default async function activate(ctx) {
     return staged;
   }
 
+  // -- skill_script: a skill's own builder, run on the worker ---------------
+  //
+  // One bundle: the script's whole skill folder, the work folder, and every
+  // /data/... file or folder the argv or the text files in those folders name
+  // (two passes, so a manifest naming another manifest is followed). The
+  // worker unpacks it under a private root and rebases /data/... paths.
+
+  const DATA = ctx.paths.home;
+  const REF = /(?<![\w.])\/data\/(?:workspaces|skills|home|tools)\/[^\s"'`)<>,;|]+/g;
+  const TEXT = new Set([".json", ".txt", ".ass", ".srt", ".vtt", ".yaml", ".yml", ".csv", ".py", ".sh", ".md", ".mjs", ".js"]);
+  const MAX_BUNDLE = 3 * 1024 ** 3;
+
+  const inside = (p, root) => {
+    const r = path.relative(root, p);
+    return r === "" || (!r.startsWith("..") && !path.isAbsolute(r));
+  };
+
+  function walk(dir, out, budget) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isSymbolicLink()) continue;
+      if (e.isDirectory()) walk(p, out, budget);
+      else if (e.isFile()) {
+        out.add(p);
+        budget.bytes += fs.statSync(p).size;
+      }
+    }
+  }
+
+  function refsIn(text) {
+    return (text.match(REF) ?? []).map((m) => m.replace(/[.:]+$/, ""));
+  }
+
+  async function buildBundle(workspace, jobId, bucket, a) {
+    if (DATA !== "/data") throw new Error(`skill_script needs the instance home at /data (this one is ${DATA})`);
+    const wsRoot = path.join(DATA, "workspaces", workspace);
+    const artifacts = ctx.paths.workspaceArtifacts(workspace);
+    const abs = (p) => (String(p).startsWith("artifacts/") ? path.join(artifacts, String(p).slice(10)) : String(p));
+    const entry = String(a.script ?? "").startsWith("/") ? String(a.script) : path.join(ctx.paths.skills, String(a.script ?? ""));
+    if (!inside(entry, ctx.paths.skills) || !fs.existsSync(entry)) throw new Error(`script must be a file under ${ctx.paths.skills}: ${a.script}`);
+    const cwd = abs(a.cwd ?? "");
+    if (!a.cwd || !inside(cwd, wsRoot) || !fs.existsSync(cwd)) throw new Error(`cwd must be an existing folder in this workspace (artifacts/...): ${a.cwd}`);
+    const argv = (Array.isArray(a.argv) ? a.argv : []).map((x) => abs(x));
+    const outputs = (Array.isArray(a.outputs) ? a.outputs : []).map((o) => (path.isAbsolute(abs(o)) ? abs(o) : path.join(cwd, String(o))));
+    if (!outputs.length) throw new Error("outputs: list the files the script writes that you need back");
+    for (const o of outputs) if (!inside(o, wsRoot)) throw new Error(`outputs must land in this workspace: ${o}`);
+    const names = outputs.map((o) => path.basename(o));
+    if (new Set(names).size !== names.length || names.includes("run.log")) throw new Error("output file names must be unique (and not run.log)");
+
+    const skillDir = path.join(ctx.paths.skills, path.relative(ctx.paths.skills, entry).split(path.sep)[0]);
+    const files = new Set();
+    const budget = { bytes: 0 };
+    walk(skillDir, files, budget);
+    walk(cwd, files, budget);
+    let scan = [...argv.join("\n").matchAll(REF)].map((m) => m[0]);
+    const scanned = new Set();
+    for (let pass = 0; pass < 2; pass++) {
+      for (const f of [...files]) {
+        if (scanned.has(f) || !TEXT.has(path.extname(f).toLowerCase())) continue;
+        scanned.add(f);
+        try {
+          if (fs.statSync(f).size < 4_000_000) scan.push(...refsIn(fs.readFileSync(f, "utf8")));
+        } catch {}
+      }
+      for (const r of new Set(scan)) {
+        if (!inside(r, DATA) || !fs.existsSync(r)) continue;
+        const st = fs.statSync(r);
+        if (st.isDirectory()) walk(r, files, budget);
+        else if (st.isFile() && !files.has(r)) {
+          files.add(r);
+          budget.bytes += st.size;
+        }
+      }
+      scan = [];
+    }
+    if (budget.bytes > MAX_BUNDLE) throw new Error(`bundle would be ${Math.round(budget.bytes / 1e9)} GB — narrow cwd to the files this build needs`);
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rg-"));
+    try {
+      const list = path.join(tmp, "files.txt");
+      fs.writeFileSync(list, [...files].map((f) => f.slice(1)).join("\n"));
+      const tgz = path.join(tmp, "bundle.tgz");
+      await run("tar", ["-czf", tgz, "-C", "/", "--files-from", list], { maxBuffer: 16 * 1024 * 1024 });
+      const dest = `inbox/${jobId}/bundle.tgz`;
+      const res = await fetch(
+        `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(bucket)}/o?uploadType=media&name=${encodeURIComponent(dest)}`,
+        { method: "POST", headers: { Authorization: `Bearer ${await gcpToken()}` }, body: fs.createReadStream(tgz), duplex: "half" },
+      );
+      if (!res.ok) throw new Error(`GCS upload bundle: HTTP ${res.status}`);
+      return {
+        args: { bundle: dest, entry, argv, cwd, outputs, timeout_min: Number(a.timeout_min) > 0 ? Number(a.timeout_min) : 25 },
+        inputs: [dest],
+        restore: Object.fromEntries(outputs.map((o) => [path.basename(o), o])),
+        files: files.size,
+        mb: Math.round(fs.statSync(tgz).size / 1e6),
+      };
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+
   async function finish(jobId, ok, detail) {
     const job = jobs[jobId];
     if (!job || job.status !== "pending") return; // callback and watchdog may race; first wins
@@ -205,6 +311,23 @@ export default async function activate(ctx) {
       try {
         const saved = await fetchOutputs(job, jobId);
         where = `\nOutputs (already in your workspace artifacts):\n${saved.map((o) => `- ${o}`).join("\n")}`;
+        if (job.restore) {
+          // skill_script: put each file back where the script writes it, so the
+          // next step finds it in place; run.log is the gate's raw output
+          const back = [];
+          let tail = "";
+          for (const rel of saved) {
+            const src = path.join(ctx.paths.workspaceArtifacts(job.workspace), rel.slice("artifacts/".length));
+            const name = path.basename(rel);
+            if (name === "run.log") tail = fs.readFileSync(src, "utf8").slice(-1500);
+            const to = job.restore[name];
+            if (!to) continue;
+            fs.mkdirSync(path.dirname(to), { recursive: true });
+            fs.copyFileSync(src, to);
+            back.push(to);
+          }
+          where = `\nFiles are back where the script writes them:\n${back.map((o) => `- ${o}`).join("\n")}\nFull log (paste it whole where a gate asks for raw output): ${saved.find((r) => r.endsWith("/run.log")) ?? "run.log"}${tail ? `\nLog tail:\n${tail}` : ""}`;
+        }
       } catch (e) {
         log.warn(`job ${jobId}: output download failed: ${e.message}`);
         where = `\nOutputs are in the shared bucket (download to artifacts FAILED: ${e.message}):\n${job.outputs.map((o) => `- ${o}`).join("\n")}`;
@@ -226,7 +349,7 @@ export default async function activate(ctx) {
   ctx.registerTool({
     name: "runner_submit",
     description:
-      `Submit ONE heavy operation to a Cloud Run worker and END your run — you will be woken with the result (never poll, never wait in-run). Available ops: ${allOps.join(", ")}. Pass your source files as artifacts/... paths — the gate uploads them to the worker and downloads finished outputs back into artifacts/renders/<job>/ for you. Light work stays in your own shell.`,
+      `Submit ONE heavy operation to a Cloud Run worker and END your run — you will be woken with the result (never poll, never wait in-run). Available ops: ${allOps.join(", ")}. Pass your source files as artifacts/... paths — the gate uploads them to the worker and downloads finished outputs back into artifacts/renders/<job>/ for you. A skill's own builder script (an assembler, a caption burner — anything that writes video) runs with op "skill_script", args {"script": "<skill>/scripts/<file>", "argv": [...], "cwd": "artifacts/<task>/<work folder>", "outputs": ["final.mp4", ...]}: the gate ships the script, its skill, the work folder and every /data file they name, and puts the outputs back where the script writes them, with the full log. Light work stays in your own shell.`,
     schema: {
       op: z.string().describe(`operation name; one of: ${allOps.join(", ")} (or "probe" with an explicit runner)`),
       args: z.string().describe("JSON object of op arguments; reference source files by the SAME paths you list in inputs"),
@@ -253,13 +376,24 @@ export default async function activate(ctx) {
       const jobId = `rj-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
       try {
         const jobBucket = runners[runnerName].bucket || defaultBucket;
-        const stagedInputs = await stageInputs(call.workspace, jobId, jobBucket, parsedInputs);
-        // args may reference the same artifacts/ paths — rewrite them in lockstep
-        let argsJson = JSON.stringify(parsedArgs);
-        parsedInputs.forEach((orig, i) => {
-          if (String(orig).startsWith("artifacts/")) argsJson = argsJson.split(String(orig)).join(stagedInputs[i]);
-        });
-        parsedArgs = JSON.parse(argsJson);
+        let stagedInputs;
+        let restore = null;
+        let bundleNote = "";
+        if (op === "skill_script") {
+          const b = await buildBundle(call.workspace, jobId, jobBucket, parsedArgs);
+          parsedArgs = b.args;
+          stagedInputs = b.inputs;
+          restore = b.restore;
+          bundleNote = ` Bundle: ${b.files} files, ${b.mb} MB.`;
+        } else {
+          stagedInputs = await stageInputs(call.workspace, jobId, jobBucket, parsedInputs);
+          // args may reference the same artifacts/ paths — rewrite them in lockstep
+          let argsJson = JSON.stringify(parsedArgs);
+          parsedInputs.forEach((orig, i) => {
+            if (String(orig).startsWith("artifacts/")) argsJson = argsJson.split(String(orig)).join(stagedInputs[i]);
+          });
+          parsedArgs = JSON.parse(argsJson);
+        }
         const execution = await launchExecution(runnerName, jobId, op, parsedArgs, stagedInputs, deadlineMin);
         jobs[jobId] = {
           op,
@@ -273,6 +407,7 @@ export default async function activate(ctx) {
           status: "pending",
           deadlineAt: Date.now() + deadlineMin * 60_000,
           createdAt: Date.now(),
+          ...(restore ? { restore } : {}),
         };
         persist();
         log.info(`job ${jobId} (${op} → ${runnerName}) launched for @${call.agent}`);
@@ -280,7 +415,7 @@ export default async function activate(ctx) {
           content: [
             {
               type: "text",
-              text: `submitted: job ${jobId} (${op} → ${runnerName}). END this run now — you will be woken when it finishes (deadline ${deadlineMin} min).`,
+              text: `submitted: job ${jobId} (${op} → ${runnerName}).${bundleNote} END this run now — you will be woken when it finishes (deadline ${deadlineMin} min).`,
             },
           ],
         };
