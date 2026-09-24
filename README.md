@@ -102,6 +102,8 @@ only the place they run moves. Args:
  "timeout_min": 25}
 ```
 
+`script` is a path in the skill library or an `artifacts/...` script the agent keeps in its workspace; `outputs` may be empty for a check that only prints (the log comes back either way).
+
 The gate bundles the script's skill folder, the work folder and every
 `/data/...` file or folder named in argv or in the text files there (two
 passes), uploads one `bundle.tgz`, and when the job lands puts each output back

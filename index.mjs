@@ -218,21 +218,24 @@ export default async function activate(ctx) {
     const wsRoot = path.join(DATA, "workspaces", workspace);
     const artifacts = ctx.paths.workspaceArtifacts(workspace);
     const abs = (p) => (String(p).startsWith("artifacts/") ? path.join(artifacts, String(p).slice(10)) : String(p));
-    const entry = String(a.script ?? "").startsWith("/") ? String(a.script) : path.join(ctx.paths.skills, String(a.script ?? ""));
-    if (!inside(entry, ctx.paths.skills) || !fs.existsSync(entry)) throw new Error(`script must be a file under ${ctx.paths.skills}: ${a.script}`);
+    // a skill's script (by its path in the library) or one the agent keeps in its own workspace
+    const sc = String(a.script ?? "");
+    const entry = sc.startsWith("/") ? sc : sc.startsWith("artifacts/") ? abs(sc) : path.join(ctx.paths.skills, sc);
+    const inSkills = inside(entry, ctx.paths.skills);
+    if (!(inSkills || inside(entry, wsRoot)) || !fs.existsSync(entry) || !fs.statSync(entry).isFile())
+      throw new Error(`script must be a file in the skill library (<skill>/scripts/<file>) or in this workspace (artifacts/...): ${a.script}`);
     const cwd = abs(a.cwd ?? "");
     if (!a.cwd || !inside(cwd, wsRoot) || !fs.existsSync(cwd)) throw new Error(`cwd must be an existing folder in this workspace (artifacts/...): ${a.cwd}`);
     const argv = (Array.isArray(a.argv) ? a.argv : []).map((x) => abs(x));
     const outputs = (Array.isArray(a.outputs) ? a.outputs : []).map((o) => (path.isAbsolute(abs(o)) ? abs(o) : path.join(cwd, String(o))));
-    if (!outputs.length) throw new Error("outputs: list the files the script writes that you need back");
     for (const o of outputs) if (!inside(o, wsRoot)) throw new Error(`outputs must land in this workspace: ${o}`);
     const names = outputs.map((o) => path.basename(o));
     if (new Set(names).size !== names.length || names.includes("run.log")) throw new Error("output file names must be unique (and not run.log)");
 
-    const skillDir = path.join(ctx.paths.skills, path.relative(ctx.paths.skills, entry).split(path.sep)[0]);
     const files = new Set();
     const budget = { bytes: 0 };
-    walk(skillDir, files, budget);
+    if (inSkills) walk(path.join(ctx.paths.skills, path.relative(ctx.paths.skills, entry).split(path.sep)[0]), files, budget);
+    else files.add(entry);
     walk(cwd, files, budget);
     let scan = [...argv.join("\n").matchAll(REF)].map((m) => m[0]);
     const scanned = new Set();
