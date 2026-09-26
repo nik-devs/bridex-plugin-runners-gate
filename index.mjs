@@ -216,12 +216,14 @@ export default async function activate(ctx) {
   async function buildBundle(workspace, jobId, bucket, a) {
     if (DATA !== "/data") throw new Error(`skill_script needs the instance home at /data (this one is ${DATA})`);
     const wsRoot = path.join(DATA, "workspaces", workspace);
+    // the skill library is the workspace's own (specs/30) — never another workspace's
+    const skillsRoot = ctx.paths.workspaceSkills(workspace);
     const artifacts = ctx.paths.workspaceArtifacts(workspace);
     const abs = (p) => (String(p).startsWith("artifacts/") ? path.join(artifacts, String(p).slice(10)) : String(p));
     // a skill's script (by its path in the library) or one the agent keeps in its own workspace
     const sc = String(a.script ?? "");
-    const entry = sc.startsWith("/") ? sc : sc.startsWith("artifacts/") ? abs(sc) : path.join(ctx.paths.skills, sc);
-    const inSkills = inside(entry, ctx.paths.skills);
+    const entry = sc.startsWith("/") ? sc : sc.startsWith("artifacts/") ? abs(sc) : path.join(skillsRoot, sc);
+    const inSkills = inside(entry, skillsRoot);
     if (!(inSkills || inside(entry, wsRoot)) || !fs.existsSync(entry) || !fs.statSync(entry).isFile())
       throw new Error(`script must be a file in the skill library (<skill>/scripts/<file>) or in this workspace (artifacts/...): ${a.script}`);
     const cwd = abs(a.cwd ?? "");
@@ -234,7 +236,7 @@ export default async function activate(ctx) {
 
     const files = new Set();
     const budget = { bytes: 0 };
-    if (inSkills) walk(path.join(ctx.paths.skills, path.relative(ctx.paths.skills, entry).split(path.sep)[0]), files, budget);
+    if (inSkills) walk(path.join(skillsRoot, path.relative(skillsRoot, entry).split(path.sep)[0]), files, budget);
     else files.add(entry);
     walk(cwd, files, budget);
     let scan = [...argv.join("\n").matchAll(REF)].map((m) => m[0]);

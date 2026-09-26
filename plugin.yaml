@@ -3,7 +3,7 @@
 # callback) and agent wakeups, which only in-process plugins have — a catalog
 # install of kind "tool" would run out-of-process and silently lose both.
 name: runners-gate
-version: 0.4.1
+version: 0.5.0
 kind: integration
 description: Submit heavy operations to Cloud Run Jobs workers and wake the requesting agent on completion — HMAC callback for speed, execution polling for truth. Multiple runners route by operation name.
 entry: index.mjs
