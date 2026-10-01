@@ -51,7 +51,7 @@ export default async function activate(ctx) {
   const cfg = ctx.config ?? {};
   const callbackBase = String(cfg.callback_base ?? "").replace(/\/+$/, "");
   const defaultBucket = String(cfg.bucket ?? "");
-  /** @type {Record<string, {job: string, ops: string[], bucket?: string}>} */
+  /** @type {Record<string, {job: string, ops: string[], bucket?: string, op_args?: Record<string, {required?: string[], optional?: string[], paths?: string[]}>}>} */
   const runners = typeof cfg.runners === "object" && cfg.runners ? cfg.runners : {};
 
   const opToRunner = new Map();
@@ -66,6 +66,24 @@ export default async function activate(ctx) {
   }
   // probe is every worker image's built-in self-test; it routes via `runner`
   const allOps = [...opToRunner.keys()];
+
+  // Per-op argument contracts (runners.<r>.op_args.<op>: {required, optional,
+  // paths}). Lanes guessed keys from op names alone — `video` for media, a URL or
+  // a /data path instead of an artifacts/ path — and five transcriptions died on
+  // the worker in a day. A declared contract is shown in the description and
+  // checked before anything is launched; a path argument joins inputs by itself.
+  const contracts = new Map();
+  for (const r of Object.values(runners))
+    for (const [op, c] of Object.entries(r.op_args ?? {}))
+      contracts.set(op, { required: c.required ?? [], optional: c.optional ?? [], paths: c.paths ?? [] });
+  const contractText = (op) => {
+    const c = contracts.get(op);
+    const key = (k) => `${k}${c.required.includes(k) ? "*" : ""}${c.paths.includes(k) ? " (artifacts/ path)" : ""}`;
+    return `${op} {${[...c.required, ...c.optional].map(key).join(", ")}}`;
+  };
+  const contractsLine = contracts.size
+    ? ` Arguments (* required; a path argument is an artifacts/... path, uploaded and listed in inputs for you): ${[...contracts.keys()].map(contractText).join("; ")}.`
+    : "";
 
   if (!callbackBase || !Object.keys(runners).length || !allOps.length) {
     ctx.needsConfig("set plugins.runners-gate.config: callback_base, bucket, and runners{job, ops}");
@@ -354,7 +372,7 @@ export default async function activate(ctx) {
   ctx.registerTool({
     name: "runner_submit",
     description:
-      `Submit ONE heavy operation to a Cloud Run worker and END your run — you will be woken with the result (never poll, never wait in-run). Available ops: ${allOps.join(", ")}. Pass your source files as artifacts/... paths — the gate uploads them to the worker and downloads finished outputs back into artifacts/renders/<job>/ for you. A skill's own builder script (an assembler, a caption burner — anything that writes video) runs with op "skill_script", args {"script": "<skill>/scripts/<file>", "argv": [...], "cwd": "artifacts/<task>/<work folder>", "outputs": ["final.mp4", ...]}: the gate ships the script, its skill, the work folder and every /data file they name, and puts the outputs back where the script writes them, with the full log. Light work stays in your own shell.`,
+      `Submit ONE heavy operation to a Cloud Run worker and END your run — you will be woken with the result (never poll, never wait in-run). Available ops: ${allOps.join(", ")}. Pass your source files as artifacts/... paths — the gate uploads them to the worker and downloads finished outputs back into artifacts/renders/<job>/ for you. A skill's own builder script (an assembler, a caption burner — anything that writes video) runs with op "skill_script", args {"script": "<skill>/scripts/<file>", "argv": [...], "cwd": "artifacts/<task>/<work folder>", "outputs": ["final.mp4", ...]}: the gate ships the script, its skill, the work folder and every /data file they name, and puts the outputs back where the script writes them, with the full log. Light work stays in your own shell.${contractsLine}`,
     schema: {
       op: z.string().describe(`operation name; one of: ${allOps.join(", ")} (or "probe" with an explicit runner)`),
       args: z.string().describe("JSON object of op arguments; reference source files by the SAME paths you list in inputs"),
@@ -376,6 +394,24 @@ export default async function activate(ctx) {
         parsedInputs = args.inputs ? JSON.parse(String(args.inputs)) : [];
       } catch {
         return { content: [{ type: "text", text: "error: args/inputs must be valid JSON" }] };
+      }
+      const contract = contracts.get(op);
+      if (contract) {
+        const known = new Set([...contract.required, ...contract.optional]);
+        const unknown = Object.keys(parsedArgs).filter((k) => !known.has(k) && !k.startsWith("_"));
+        const missing = contract.required.filter((k) => parsedArgs[k] === undefined || parsedArgs[k] === "");
+        if (unknown.length || missing.length)
+          return {
+            content: [{ type: "text", text: `error: ${contractText(op)} —${unknown.length ? ` unknown: ${unknown.join(", ")};` : ""}${missing.length ? ` missing: ${missing.join(", ")};` : ""} nothing was launched` }],
+          };
+        for (const k of contract.paths) {
+          for (const v of [].concat(parsedArgs[k] ?? [])) {
+            const path = String(v);
+            if (/^https?:\/\//.test(path) || path.startsWith("/"))
+              return { content: [{ type: "text", text: `error: ${op}.${k} must be an artifacts/... path — the gate uploads it to the worker; a URL or an absolute /data path does not reach it (${path}). Nothing was launched` }] };
+            if (path.startsWith("artifacts/") && !parsedInputs.includes(path)) parsedInputs.push(path);
+          }
+        }
       }
       const deadlineMin = Number(args.deadline_min) > 0 ? Number(args.deadline_min) : DEFAULT_DEADLINE_MIN;
       const jobId = `rj-${Date.now().toString(36)}-${crypto.randomBytes(3).toString("hex")}`;
