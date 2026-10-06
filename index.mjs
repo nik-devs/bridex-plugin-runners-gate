@@ -327,6 +327,15 @@ export default async function activate(ctx) {
     }
   }
 
+  function settleTracked(job) {
+    if (!job.trackId) return;
+    try {
+      ctx.jobs?.settle?.(job.trackId, job.status === "done" ? { status: "succeeded" } : { status: "failed", error: job.error });
+    } catch (e) {
+      log.warn(`could not settle tracked job: ${e.message}`);
+    }
+  }
+
   async function finish(jobId, ok, detail) {
     const job = jobs[jobId];
     if (!job || job.status !== "pending") return; // callback and watchdog may race; first wins
@@ -334,6 +343,7 @@ export default async function activate(ctx) {
     if (ok) job.outputs = detail.outputs ?? [];
     else job.error = detail.error ?? "unknown";
     persist();
+    settleTracked(job);
     // the render's minutes belong to the task like any other paid tool — the
     // task page and the spend tables read them (price per minute is optional)
     try {
@@ -473,6 +483,13 @@ export default async function activate(ctx) {
           createdAt: Date.now(),
           ...(restore ? { restore } : {}),
         };
+        // the instance sees the job as the agent's pending work: a task waiting
+        // on a render is not «left with nothing to come back to»
+        try {
+          jobs[jobId].trackId = ctx.jobs?.track?.({ workspace: call.workspace, agent: call.agent, taskId: call.taskId ?? null, sessionKey: call.sessionKey ?? null, runId: call.runId ?? null, externalId: jobId, model: op, label: `${op} on ${runnerName}` });
+        } catch (e) {
+          log.warn(`job ${jobId}: could not register it with the instance: ${e.message}`);
+        }
         persist();
         log.info(`job ${jobId} (${op} → ${runnerName}) launched for @${call.agent}`);
         return {
@@ -537,6 +554,7 @@ export default async function activate(ctx) {
           job.status = "failed";
           job.error = "closed by the watchdog long after its deadline — nobody was woken";
           persist();
+          settleTracked(job);
           log.warn(`job ${id}: closed quietly, ${Math.round((Date.now() - job.deadlineAt) / 3_600_000)}h past its deadline`);
           continue;
         }
