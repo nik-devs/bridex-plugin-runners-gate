@@ -40,6 +40,10 @@ const run = promisify(execFile);
 
 const DEFAULT_DEADLINE_MIN = 30;
 const WATCH_INTERVAL_MS = 90_000;
+/** How long a succeeded execution may stay without its callback before the gate fetches the outputs itself. */
+const CALLBACK_GRACE_MS = 3 * 60_000;
+/** A pending job this long past its deadline is closed without waking anyone. */
+const STALE_AFTER_MS = 2 * 3_600_000;
 const LEDGER_TTL_DAYS = 7;
 
 export default async function activate(ctx) {
@@ -133,15 +137,34 @@ export default async function activate(ctx) {
     return lro?.metadata?.name ?? null; // execution resource — what the watchdog polls
   }
 
+  /**
+   * What Cloud Run says about an execution: queued (not started), running,
+   * succeeded, failed or cancelled — with the reason it gives. «running» used
+   * to stand for everything that had not finished, so a run that never started
+   * and one that was working looked the same.
+   */
   async function executionState(execution) {
     const res = await fetch(`https://run.googleapis.com/v2/${execution}`, {
       headers: { authorization: `Bearer ${await gcpToken()}` },
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { state: "unknown", detail: `Cloud Run HTTP ${res.status}` };
     const e = await res.json();
-    if ((e.succeededCount ?? 0) > 0) return "succeeded";
-    if ((e.failedCount ?? 0) > 0 || (e.cancelledCount ?? 0) > 0) return "failed";
-    return "running";
+    const done = (e.conditions ?? []).find((c) => c.type === "Completed");
+    const detail = [done?.message, done?.reason].filter(Boolean).join(" — ") || undefined;
+    if ((e.succeededCount ?? 0) > 0) return { state: "succeeded", detail };
+    if ((e.cancelledCount ?? 0) > 0) return { state: "cancelled", detail };
+    if ((e.failedCount ?? 0) > 0 || done?.state === "CONDITION_FAILED") return { state: "failed", detail };
+    if (!e.startTime && !(e.runningCount > 0)) return { state: "queued", detail };
+    return { state: "running", detail: e.runningCount > 0 ? `${e.runningCount} task(s) running` : detail };
+  }
+
+  /** Files a job wrote to the bucket under renders/<job>/ — what a lost callback would have listed. */
+  async function listJobOutputs(job, jobId) {
+    const bucket = job.bucket || defaultBucket;
+    const url = `https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(bucket)}/o?prefix=${encodeURIComponent(`renders/${jobId}/`)}&fields=items(name)&maxResults=200`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${await gcpToken()}` } });
+    if (!res.ok) throw new Error(`GCS list HTTP ${res.status}`);
+    return ((await res.json()).items ?? []).map((o) => o.name).filter((n) => !n.endsWith("/"));
   }
 
   // -- waking the requester -------------------------------------------------
@@ -362,7 +385,7 @@ export default async function activate(ctx) {
       key: `runner:${jobId}`,
       ...(job.sessionKey ? { sessionKey: job.sessionKey } : {}),
       prompt: ok
-        ? `Runner job ${jobId} (${job.op} on ${job.runner}) finished successfully.${where}\nContinue the work that requested it${job.taskId ? ` (task ${job.taskId})` : ""}.`
+        ? `Runner job ${jobId} (${job.op} on ${job.runner}) finished successfully${detail?.note ? ` (${detail.note})` : ""}.${where}\nContinue the work that requested it${job.taskId ? ` (task ${job.taskId})` : ""}.`
         : `Runner job ${jobId} (${job.op} on ${job.runner}) FAILED: ${job.error}. Decide: retry with adjusted args, or report the blocker.`,
     });
   }
@@ -473,7 +496,11 @@ export default async function activate(ctx) {
     async handler(args) {
       const job = jobs[String(args.job_id)];
       if (!job) return { content: [{ type: "text", text: "error: unknown job id" }] };
-      return { content: [{ type: "text", text: JSON.stringify({ id: args.job_id, ...job }) }] };
+      // the execution as Cloud Run sees it now: queued vs running vs gone
+      let execution = null;
+      if (job.status === "pending" && job.execution)
+        execution = await executionState(job.execution).catch((e) => ({ state: "unknown", detail: e.message }));
+      return { content: [{ type: "text", text: JSON.stringify({ id: args.job_id, ...job, ...(execution ? { execution } : {}), ...(job.status === "pending" ? { note: "you are woken when it ends or its deadline passes — no need to keep checking" } : {}) }) }] };
     },
   });
 
@@ -504,15 +531,47 @@ export default async function activate(ctx) {
     void (async () => {
       for (const [id, job] of Object.entries(jobs)) {
         if (job.status !== "pending") continue;
+        // long past its deadline (a gate restart, an older gate that never
+        // closed it): the work moved on — close it in the ledger, wake nobody
+        if (Date.now() - job.deadlineAt > STALE_AFTER_MS) {
+          job.status = "failed";
+          job.error = "closed by the watchdog long after its deadline — nobody was woken";
+          persist();
+          log.warn(`job ${id}: closed quietly, ${Math.round((Date.now() - job.deadlineAt) / 3_600_000)}h past its deadline`);
+          continue;
+        }
+        let live = null;
         try {
-          const state = job.execution ? await executionState(job.execution) : null;
-          if (state === "failed") return void finish(id, false, { error: "Cloud Run execution failed (no callback received)" });
-          if (state === "succeeded") continue; // give the callback a beat; the deadline still backstops
+          live = job.execution ? await executionState(job.execution) : null;
         } catch (err) {
           log.warn(`watchdog poll failed for ${id}: ${err.message}`);
         }
+        if (live) {
+          job.live = live.state; // what runner_status shows between polls
+          if (live.state === "failed" || live.state === "cancelled") {
+            await finish(id, false, { error: `Cloud Run execution ${live.state}${live.detail ? `: ${live.detail}` : ""} (no callback received)` });
+            continue; // the rest of the ledger still gets its check
+          }
+          if (live.state === "succeeded") {
+            // finished but the callback never came — it used to wait for it
+            // forever, past the deadline too: a montage sat «pending» half an
+            // hour while two agents kept checking on it
+            job.succeededAt ??= Date.now();
+            if (Date.now() - job.succeededAt < CALLBACK_GRACE_MS) continue;
+            try {
+              const outputs = await listJobOutputs(job, id);
+              if (outputs.length) await finish(id, true, { outputs, note: "the worker's callback never arrived — outputs taken from the bucket" });
+              else await finish(id, false, { error: "Cloud Run says the execution succeeded, but it wrote no outputs and never called back" });
+            } catch (err) {
+              await finish(id, false, { error: `execution succeeded without a callback, and its outputs could not be listed: ${err.message}` });
+            }
+            continue;
+          }
+        }
         if (Date.now() > job.deadlineAt)
-          void finish(id, false, { error: `deadline exceeded (${Math.round((job.deadlineAt - job.createdAt) / 60000)} min) — treat as hung` });
+          await finish(id, false, {
+            error: `deadline exceeded (${Math.round((job.deadlineAt - job.createdAt) / 60000)} min)${live ? ` — Cloud Run still reports it ${live.state}${live.detail ? ` (${live.detail})` : ""}` : ""}; treat as hung`,
+          });
       }
       const cutoff = Date.now() - LEDGER_TTL_DAYS * 86_400_000;
       let dirty = false;
