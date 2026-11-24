@@ -105,7 +105,9 @@ export default async function activate(ctx) {
   } catch {
     /* first boot */
   }
-  const persist = () => fs.writeFileSync(ledgerFile, JSON.stringify(jobs, null, 2));
+  // compact: the ledger is rewritten on every launch and callback, and a busy
+  // week of it pretty-printed was 12 MB
+  const persist = () => fs.writeFileSync(ledgerFile, JSON.stringify(jobs));
 
   // -- GCP auth via the VM's metadata server (no key files) -----------------
 
@@ -232,26 +234,44 @@ export default async function activate(ctx) {
   const REF = /(?<![\w.])\/data\/(?:workspaces|skills|home|tools)\/[^\s"'`)<>,;|]+/g;
   const TEXT = new Set([".json", ".txt", ".ass", ".srt", ".vtt", ".yaml", ".yml", ".csv", ".py", ".sh", ".md", ".mjs", ".js"]);
   const MAX_BUNDLE = 3 * 1024 ** 3;
+  // a bundle is a script, its skill and its work folder — a few thousand
+  // files at most; past this the walk stops instead of going on
+  const MAX_BUNDLE_FILES = 20_000;
 
   const inside = (p, root) => {
     const r = path.relative(root, p);
     return r === "" || (!r.startsWith("..") && !path.isAbsolute(r));
   };
 
-  function walk(dir, out, budget) {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+  /**
+   * Every file under dir into `out`. Asynchronous and stopped at the limits:
+   * the walk ran on the server's one thread, and a skill naming its team's
+   * whole artifacts folder (400 thousand files) had it stat every one before
+   * the size check said no — the instance stood still 4–5 minutes per
+   * submission, back to back when the finishers rendered a batch (2026-11-24).
+   */
+  async function walk(dir, out, budget) {
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
       const p = path.join(dir, e.name);
       if (e.isSymbolicLink()) continue;
-      if (e.isDirectory()) walk(p, out, budget);
-      else if (e.isFile()) {
+      if (e.isDirectory()) await walk(p, out, budget);
+      else if (e.isFile() && !out.has(p)) {
         out.add(p);
-        budget.bytes += fs.statSync(p).size;
+        budget.bytes += (await fs.promises.stat(p).catch(() => ({ size: 0 }))).size;
+        if (out.size > MAX_BUNDLE_FILES) throw new Error(`bundle would hold over ${MAX_BUNDLE_FILES} files (at ${dir}) — narrow cwd, and the /data folders your files name, to what this build needs`);
+        if (budget.bytes > MAX_BUNDLE) throw new Error(`bundle would be over ${Math.round(MAX_BUNDLE / 1e9)} GB (at ${dir}) — narrow cwd, and the /data folders your files name, to what this build needs`);
       }
     }
   }
 
   function refsIn(text) {
-    return (text.match(REF) ?? []).map((m) => m.replace(/[.:]+$/, ""));
+    return (text.match(REF) ?? []).map((m) => m.replace(/[.:]+$/, "").replace(/\/+$/, ""));
   }
 
   async function buildBundle(workspace, jobId, bucket, a) {
@@ -265,10 +285,17 @@ export default async function activate(ctx) {
     const sc = String(a.script ?? "");
     const entry = sc.startsWith("/") ? sc : sc.startsWith("artifacts/") ? abs(sc) : path.join(skillsRoot, sc);
     const inSkills = inside(entry, skillsRoot);
-    if (!(inSkills || inside(entry, wsRoot)) || !fs.existsSync(entry) || !fs.statSync(entry).isFile())
+    const entryStat = await fs.promises.stat(entry).catch(() => null);
+    if (!(inSkills || inside(entry, wsRoot)) || !entryStat?.isFile())
       throw new Error(`script must be a file in the skill library (<skill>/scripts/<file>) or in this workspace (artifacts/...): ${a.script}`);
     const cwd = abs(a.cwd ?? "");
-    if (!a.cwd || !inside(cwd, wsRoot) || !fs.existsSync(cwd)) throw new Error(`cwd must be an existing folder in this workspace (artifacts/...): ${a.cwd}`);
+    if (!a.cwd || !inside(cwd, wsRoot) || !(await fs.promises.stat(cwd).catch(() => null))) throw new Error(`cwd must be an existing folder in this workspace (artifacts/...): ${a.cwd}`);
+    // a whole artifacts folder, workspace or home is never a build's input: a
+    // note in a skill («results go under /data/workspaces/<ws>/artifacts»)
+    // shipped — or walked — everything the team ever made
+    const tooWide = (r) =>
+      [artifacts, wsRoot, path.join(DATA, "workspaces"), path.join(DATA, "home"), path.join(DATA, "tools"), path.join(DATA, "skills")].some((root) => inside(root, r));
+    if (inside(artifacts, cwd)) throw new Error(`cwd must be a work folder inside artifacts/, not the whole of it: ${a.cwd}`);
     const argv = (Array.isArray(a.argv) ? a.argv : []).map((x) => abs(x));
     const outputs = (Array.isArray(a.outputs) ? a.outputs : []).map((o) => (path.isAbsolute(abs(o)) ? abs(o) : path.join(cwd, String(o))));
     for (const o of outputs) if (!inside(o, wsRoot)) throw new Error(`outputs must land in this workspace: ${o}`);
@@ -277,23 +304,29 @@ export default async function activate(ctx) {
 
     const files = new Set();
     const budget = { bytes: 0 };
-    if (inSkills) walk(path.join(skillsRoot, path.relative(skillsRoot, entry).split(path.sep)[0]), files, budget);
+    const skipped = new Set();
+    if (inSkills) await walk(path.join(skillsRoot, path.relative(skillsRoot, entry).split(path.sep)[0]), files, budget);
     else files.add(entry);
-    walk(cwd, files, budget);
-    let scan = [...argv.join("\n").matchAll(REF)].map((m) => m[0]);
+    await walk(cwd, files, budget);
+    let scan = [...argv.join("\n").matchAll(REF)].map((m) => m[0].replace(/[.:]+$/, "").replace(/\/+$/, ""));
     const scanned = new Set();
     for (let pass = 0; pass < 2; pass++) {
       for (const f of [...files]) {
         if (scanned.has(f) || !TEXT.has(path.extname(f).toLowerCase())) continue;
         scanned.add(f);
         try {
-          if (fs.statSync(f).size < 4_000_000) scan.push(...refsIn(fs.readFileSync(f, "utf8")));
+          if ((await fs.promises.stat(f)).size < 4_000_000) scan.push(...refsIn(await fs.promises.readFile(f, "utf8")));
         } catch {}
       }
       for (const r of new Set(scan)) {
-        if (!inside(r, DATA) || !fs.existsSync(r)) continue;
-        const st = fs.statSync(r);
-        if (st.isDirectory()) walk(r, files, budget);
+        if (!inside(r, DATA)) continue;
+        if (tooWide(r)) {
+          skipped.add(r);
+          continue;
+        }
+        const st = await fs.promises.stat(r).catch(() => null);
+        if (!st) continue;
+        if (st.isDirectory()) await walk(r, files, budget);
         else if (st.isFile() && !files.has(r)) {
           files.add(r);
           budget.bytes += st.size;
@@ -308,7 +341,9 @@ export default async function activate(ctx) {
       const list = path.join(tmp, "files.txt");
       fs.writeFileSync(list, [...files].map((f) => f.slice(1)).join("\n"));
       const tgz = path.join(tmp, "bundle.tgz");
-      await run("tar", ["-czf", tgz, "-C", "/", "--files-from", list], { maxBuffer: 16 * 1024 * 1024 });
+      // a live work folder: a temp file listed a moment ago may be gone by now —
+      // that failed the whole submission («Cannot stat»)
+      await run("tar", ["-czf", tgz, "--ignore-failed-read", "-C", "/", "--files-from", list], { maxBuffer: 16 * 1024 * 1024 });
       const dest = `inbox/${jobId}/bundle.tgz`;
       const res = await fetch(
         `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(bucket)}/o?uploadType=media&name=${encodeURIComponent(dest)}`,
@@ -321,6 +356,7 @@ export default async function activate(ctx) {
         restore: Object.fromEntries(outputs.map((o) => [path.basename(o), o])),
         files: files.size,
         mb: Math.round(fs.statSync(tgz).size / 1e6),
+        skipped: [...skipped],
       };
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -458,7 +494,7 @@ export default async function activate(ctx) {
           parsedArgs = b.args;
           stagedInputs = b.inputs;
           restore = b.restore;
-          bundleNote = ` Bundle: ${b.files} files, ${b.mb} MB.`;
+          bundleNote = ` Bundle: ${b.files} files, ${b.mb} MB.${b.skipped.length ? ` Not shipped (a whole artifacts folder, workspace or home — name the folder the script needs instead): ${b.skipped.join(", ")}.` : ""}`;
         } else {
           stagedInputs = await stageInputs(call.workspace, jobId, jobBucket, parsedInputs);
           // args may reference the same artifacts/ paths — rewrite them in lockstep

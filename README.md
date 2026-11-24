@@ -110,3 +110,8 @@ passes), uploads one `bundle.tgz`, and when the job lands puts each output back
 at its original path and hands the agent the full `run.log`. Requires the
 instance home at `/data`; the worker image must serve `skill_script`
 (bridex-runner-montage ≥ 0.5).
+
+A named folder that holds a whole artifacts folder, workspace, `/data/home`,
+`/data/tools` or `/data/skills` is not shipped — a skill's note about where
+results go is not an input — and the agent is told which ones were left out.
+The walk is asynchronous and stops at 20 000 files or 3 GB (0.6.3).
