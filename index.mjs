@@ -44,7 +44,10 @@ const WATCH_INTERVAL_MS = 90_000;
 const CALLBACK_GRACE_MS = 3 * 60_000;
 /** A pending job this long past its deadline is closed without waking anyone. */
 const STALE_AFTER_MS = 2 * 3_600_000;
-const LEDGER_TTL_DAYS = 7;
+// finished jobs are kept this long for runner_status — the agent got its
+// result when it was woken; a busy team ran 1 500 jobs a day, and a week of
+// them was a 10 MB ledger rewritten on every launch and callback (2026-11-24)
+const LEDGER_TTL_DAYS = 2;
 
 export default async function activate(ctx) {
   const { z, log } = ctx;
@@ -105,9 +108,12 @@ export default async function activate(ctx) {
   } catch {
     /* first boot */
   }
-  // compact: the ledger is rewritten on every launch and callback, and a busy
-  // week of it pretty-printed was 12 MB
-  const persist = () => fs.writeFileSync(ledgerFile, JSON.stringify(jobs));
+  // compact, and whole or not at all: a write cut short left a ledger that
+  // does not parse, and the next start would forget every pending job
+  const persist = () => {
+    fs.writeFileSync(`${ledgerFile}.tmp`, JSON.stringify(jobs));
+    fs.renameSync(`${ledgerFile}.tmp`, ledgerFile);
+  };
 
   // -- GCP auth via the VM's metadata server (no key files) -----------------
 
@@ -548,7 +554,7 @@ export default async function activate(ctx) {
     schema: { job_id: z.string() },
     async handler(args) {
       const job = jobs[String(args.job_id)];
-      if (!job) return { content: [{ type: "text", text: "error: unknown job id" }] };
+      if (!job) return { content: [{ type: "text", text: `error: unknown job id — a finished job is kept ${LEDGER_TTL_DAYS} days; its outputs are where it put them (artifacts/renders/<job>/, or a script's own output paths), named in the message that woke you` }] };
       // the execution as Cloud Run sees it now: queued vs running vs gone
       let execution = null;
       if (job.status === "pending" && job.execution)
