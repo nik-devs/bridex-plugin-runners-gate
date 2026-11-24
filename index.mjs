@@ -3,7 +3,6 @@ import fs from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
-import os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -101,6 +100,19 @@ export default async function activate(ctx) {
 
   const stateDir = path.join(ctx.paths.state, "runners-gate");
   fs.mkdirSync(stateDir, { recursive: true });
+  // bundles are built here, on the data volume: in the system temp they sat
+  // on the container's root disk — eight at once took 2.4 GB of a 30 GB disk
+  // with 2.4 GB left, and a full root disk stops the whole server (2026-11-24).
+  // A build cut short by a restart leaves its folder; those go at start
+  const buildDir = path.join(stateDir, "tmp");
+  fs.mkdirSync(buildDir, { recursive: true });
+  for (const name of fs.readdirSync(buildDir))
+    try {
+      const p = path.join(buildDir, name);
+      if (name.startsWith("rg-") && Date.now() - fs.statSync(p).mtimeMs > 6 * 3_600_000) fs.rmSync(p, { recursive: true, force: true });
+    } catch {
+      /* gone meanwhile */
+    }
   const ledgerFile = path.join(stateDir, "jobs.json");
   let jobs = {};
   try {
@@ -342,7 +354,7 @@ export default async function activate(ctx) {
     }
     if (budget.bytes > MAX_BUNDLE) throw new Error(`bundle would be ${Math.round(budget.bytes / 1e9)} GB — narrow cwd to the files this build needs`);
 
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rg-"));
+    const tmp = await fs.promises.mkdtemp(path.join(buildDir, "rg-"));
     try {
       const list = path.join(tmp, "files.txt");
       fs.writeFileSync(list, [...files].map((f) => f.slice(1)).join("\n"));
